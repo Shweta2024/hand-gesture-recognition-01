@@ -14,6 +14,7 @@ import mediapipe as mp
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
+import numpy as np
 
 
 def get_args():
@@ -38,38 +39,29 @@ def get_args():
     return args
 
 
-def recognizeHandGesture():
-    # Argumet Passing ----------------------------------------------------
-    args = get_args()
+def recognizeHandGesture(image_buffer):
+    # Decode the image buffer into a numpy array
+    nparr = np.frombuffer(image_buffer, np.uint8)
+    image = cv.imdecode(nparr, cv.IMREAD_COLOR)
 
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
+    # save img to local
+    # cv.imwrite('hand_gesture_image.png', image)
 
-    use_static_image_mode = args.use_static_image_mode
-    min_detection_confidence = args.min_detection_confidence
-    min_tracking_confidence = args.min_tracking_confidence
-
-    use_brect = True
-
-    # Camera Preparation ----------------------------------------------------
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+    # # Detection Implementation ----------------------------------------------------
+    image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
     # Model Load ----------------------------------------------------
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
-        static_image_mode=use_static_image_mode,
-        max_num_hands=1, # max number of hands to recognize
-        min_detection_confidence=min_detection_confidence,
-        min_tracking_confidence=min_tracking_confidence,
+        static_image_mode=True,
+        max_num_hands=1,  # max number of hands to recognize
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
     )
 
     keypoint_classifier = KeyPointClassifier()
 
     point_history_classifier = PointHistoryClassifier()
-
 
     with open('model/keypoint_classifier/keypoint_classifier_label.csv',
               encoding='utf-8-sig') as f:
@@ -85,116 +77,72 @@ def recognizeHandGesture():
             row[0] for row in point_history_classifier_labels
         ]
 
-
-    cvFpsCalc = CvFpsCalc(buffer_len=10)
-
-
     history_length = 16
     point_history = deque(maxlen=history_length)
 
-
     finger_gesture_history = deque(maxlen=history_length)
 
+    debug_image = copy.deepcopy(image)
 
-    mode = 0
-    
+    # Detection Implementation ----------------------------------------------------
+    image.flags.writeable = False
+    results = hands.process(image)
+    image.flags.writeable = True
     thumbsUp = False
-    while thumbsUp == False:
-        fps = cvFpsCalc.get()
+    if results.multi_hand_landmarks is not None:
+        for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
+                                              results.multi_handedness):
+            # bounding box calculation
+            brect = calc_bounding_rect(debug_image, hand_landmarks)
 
-        # Process key (ESC: end) ----------------------------------------------------
-        key = cv.waitKey(10)
-        if key == 27:  # ESC
-            break
-        number, mode = select_mode(key, mode)
+            # landmark calculation
+            landmark_list = calc_landmark_list(debug_image, hand_landmarks)
 
-        # Camera Capture ----------------------------------------------------
-        ret, image = cap.read() # reads the frame
-        
-        if not ret:
-            break
+            # conversion to relative coordinates/normalized coordinates
+            pre_processed_landmark_list = pre_process_landmark(
+                landmark_list)
+            pre_processed_point_history_list = pre_process_point_history(
+                debug_image, point_history)
 
-        image = cv.flip(image, 1)  # Mirror Display
+            hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
 
-        debug_image = copy.deepcopy(image)
+            # print the recognized hand gesture
+            # print(keypoint_classifier_labels[hand_sign_id])
+            # print(hand_sign_id)
+            if (keypoint_classifier_labels[hand_sign_id] == keypoint_classifier_labels[4] or
+                keypoint_classifier_labels[hand_sign_id] == keypoint_classifier_labels[3]):
+                thumbsUp = True
 
-        # Detection Implementation ----------------------------------------------------
-        image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+            # disable the pointer classification
+            # set "Not applicable" to the index of the pointer label to get pointer classification
+            if hand_sign_id == "Not applicable":
+                point_history.append(landmark_list[8])
+            else:
+                point_history.append([0, 0])
 
-        image.flags.writeable = False
-        results = hands.process(image)
-        image.flags.writeable = True
+            finger_gesture_id = 0
+            point_history_len = len(pre_processed_point_history_list)
+            if point_history_len == (history_length * 2):
+                finger_gesture_id = point_history_classifier(
+                    pre_processed_point_history_list)
 
-        #  ----------------------------------------------------
-        if results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
-                                                  results.multi_handedness):
-                # print(hand_landmarks)
+            finger_gesture_history.append(finger_gesture_id)
+            most_common_fg_id = Counter(
+                finger_gesture_history).most_common()
 
-                # bounding box calculation
-                brect = calc_bounding_rect(debug_image, hand_landmarks)
+            debug_image = draw_bounding_rect(True, debug_image, brect)
+            debug_image = draw_landmarks(debug_image, landmark_list)
+            debug_image = draw_info_text(
+                debug_image,
+                brect,
+                handedness,
+                keypoint_classifier_labels[hand_sign_id],
+                point_history_classifier_labels[most_common_fg_id[0][0]],
+            )
+    else:
+        point_history.append([0, 0])
 
-                # landmark calculation
-                landmark_list = calc_landmark_list(debug_image, hand_landmarks)
-
-                # conversion to relative coordinates/normalized coordinates
-                pre_processed_landmark_list = pre_process_landmark(
-                    landmark_list)
-                pre_processed_point_history_list = pre_process_point_history(
-                    debug_image, point_history)
-
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
-
-
-                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-
-                # print the recognized hand geture
-                # print(keypoint_classifier_labels[hand_sign_id])
-                if(keypoint_classifier_labels[hand_sign_id] == keypoint_classifier_labels[4]):
-                    thumbsUp = True
-
-                # disable the pointer classification
-                # set "Not applicable" to the index of the pointer lable to get pointer classification
-                if hand_sign_id == "Not applicable":  
-                    point_history.append(landmark_list[8])  
-                else:
-                    point_history.append([0, 0])
-
-
-                finger_gesture_id = 0
-                point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(
-                        pre_processed_point_history_list)
-
-
-                finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
-
-
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                debug_image = draw_landmarks(debug_image, landmark_list)
-                debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
-                )
-        else:
-            point_history.append([0, 0])
-
-        debug_image = draw_info(debug_image, fps, mode, number)
-
-
-        cv.imshow('Hand Gesture Recognition', debug_image)
-
-    cap.release()
-    cv.destroyAllWindows()
-    return keypoint_classifier_labels[hand_sign_id]
-
+    return thumbsUp
 
 def select_mode(key, mode):
     number = -1
